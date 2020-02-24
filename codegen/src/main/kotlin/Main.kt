@@ -7,22 +7,19 @@ import com.faintstructure.ebeanoncrack.types.LSimpleListProperty
 import com.faintstructure.ebeanoncrack.types.LSimpleProperty
 import com.google.auto.service.AutoService
 import com.squareup.kotlinpoet.*
-import com.squareup.kotlinpoet.TypeName
 import com.squareup.kotlinpoet.ParameterizedTypeName.Companion.parameterizedBy
 import com.squareup.kotlinpoet.FileSpec
 import com.squareup.kotlinpoet.metadata.*
-import kotlinx.metadata.KmClassifier
 import javax.annotation.processing.*
 import javax.lang.model.SourceVersion
 import javax.lang.model.element.TypeElement
 import java.io.File
-import java.sql.Types
 
 @AutoService(Processor::class) // For registering the service
 @SupportedSourceVersion(SourceVersion.RELEASE_8) // to support Java 8
 @SupportedOptions(FileGenerator.KAPT_KOTLIN_GENERATED_OPTION_NAME)
 @KotlinPoetMetadataPreview
-class FileGenerator : AbstractProcessor(){
+class FileGenerator : AbstractProcessor() {
 
     override fun getSupportedAnnotationTypes(): MutableSet<String> {
         return mutableSetOf(EntityOnCrack::class.java.name)
@@ -32,217 +29,153 @@ class FileGenerator : AbstractProcessor(){
         return SourceVersion.latest()
     }
 
-    data class Property(val owner: ImmutableKmClass, val property: ImmutableKmProperty)
-    data class Arrow(val from: ImmutableKmClass, val to: ImmutableKmType, val name: String)
-
-    fun writeFileSpec(spec: FileSpec) {
+    private fun writeFileSpec(spec: FileSpec) {
         val kaptKotlinGeneratedDir = processingEnv.options[KAPT_KOTLIN_GENERATED_OPTION_NAME]
         val file = File(kaptKotlinGeneratedDir, spec.name)
         file.writeText(spec.toString())
     }
 
-    fun classNameToQualifiedName(className: ClassName): String {
-        return className.packageName.replace('.', '/') + '/' + className.simpleName
+    private fun lObjectTypeName(entityClassName: ClassName) = "L${entityClassName.simpleName}"
+    private fun lClassTypeName(entityClassName: ClassName) = "LC${entityClassName.simpleName}"
+    private fun lInterfaceName(entityClassName: ClassName) = "LI${entityClassName.simpleName}"
+    private fun lUnboxedArrowName(entityClassName: ClassName) = "LUA${entityClassName.simpleName}"
+    private fun lListArrowName(entityClassName: ClassName) = "LLA${entityClassName.simpleName}"
+
+    private fun buildEntityObjectType(packageName: String, entityClassName: ClassName): TypeSpec {
+        return TypeSpec.objectBuilder(lObjectTypeName(entityClassName))
+            .superclass(ClassName(packageName, lClassTypeName(entityClassName)).parameterizedBy(entityClassName))
+            .addSuperclassConstructorParameter("null")
+            .build()
     }
 
-    fun qualifiedNameToClassName(qualifiedName: String): ClassName {
-        val split = qualifiedName.split("/")
+    private enum class ArrowType { UNBOXED, LIST }
 
-        val packageName = split.dropLast(1).joinToString(".")
-        val className = split.last().split(".")
-
-        return ClassName(packageName, className)
-    }
-
-    fun typeToQualifiedName(type: ImmutableKmType): String {
-        return when (val classifier = type.classifier) {
-            is KmClassifier.Class -> classifier.name
-            else -> throw null!! // TODO: message of unsupported classifier
+    private fun buildArrowClassType(packageName: String, entityClassName: ClassName, arrowType: ArrowType): TypeSpec {
+        val rootTypeVar = TypeVariableName("Root")
+        val name = when (arrowType) {
+            ArrowType.LIST -> lListArrowName(entityClassName)
+            ArrowType.UNBOXED -> lUnboxedArrowName(entityClassName)
         }
+        val boxedType = when (arrowType) {
+            ArrowType.LIST -> List::class.asClassName().parameterizedBy(entityClassName)
+            ArrowType.UNBOXED -> entityClassName
+        }
+
+        return TypeSpec.classBuilder(name)
+            .addTypeVariable(rootTypeVar)
+            .superclass(ClassName(packageName, lClassTypeName(entityClassName)).parameterizedBy(rootTypeVar))
+            .addSuperclassConstructorParameter(CodeBlock.of("_propPath"))
+            .addSuperinterface(LProperty::class.asClassName().parameterizedBy(rootTypeVar, boxedType, entityClassName))
+            .primaryConstructor(FunSpec.constructorBuilder()
+                .addParameter("_propPath", String::class.asClassName())
+                .addParameter("_propName", String::class.asClassName())
+                .build())
+            .addProperty(PropertySpec.builder("_propPath", String::class.asClassName())
+                .initializer("_propPath")
+                .addModifiers(KModifier.PRIVATE)
+                .build())
+            .addProperty(PropertySpec.builder("_propName", String::class.asClassName())
+                .initializer("_propName")
+                .addModifiers(KModifier.PRIVATE)
+                .build())
+            .addFunction(FunSpec.builder("getPropertyPath")
+                .returns(String::class)
+                .addModifiers(KModifier.OVERRIDE)
+                .addCode("return _propPath")
+                .build())
+            .addFunction(FunSpec.builder("getPropertyName")
+                .returns(String::class)
+                .addModifiers(KModifier.OVERRIDE)
+                .addCode("return _propName")
+                .build())
+            .build()
     }
 
-    fun typeToClassName(type: ImmutableKmType): TypeName {
-        return when (val classifier = type.classifier) {
-            is KmClassifier.Class -> {
-                val className = qualifiedNameToClassName(classifier.name)
-                if (type.arguments.isNotEmpty()) {
-                    className.parameterizedBy(type.arguments.map { typeToClassName(it.type ?: throw null!! /* TODO message*/) })
-                } else {
-                    className
-                }
+    private fun getArrowTypeName(packageName: String,
+                         rootTypeVar: TypeName,
+                         property: ImmutableKmProperty,
+                         allEntityClasses: List<ImmutableKmClass>): TypeName? {
+        val propertyType = property.returnType.asTypeName() ?: return null
+
+        val isList = propertyType is ParameterizedTypeName &&
+                propertyType.rawType.reflectionName() == List::class.asClassName().reflectionName()
+        val unboxedType = if (isList) {
+            (propertyType as ParameterizedTypeName).typeArguments[0] as? ClassName ?: return null
+        } else {
+            propertyType as? ClassName ?: return null
+        }
+
+        return if (allEntityClasses.any { it.name == unboxedType.jvmName }) {
+            ClassName(packageName, if (isList) lListArrowName(unboxedType) else lUnboxedArrowName(unboxedType))
+                .parameterizedBy(rootTypeVar)
+        } else {
+            if (isList) {
+                LSimpleListProperty::class.asClassName().parameterizedBy(rootTypeVar, unboxedType)
+            } else {
+                LSimpleProperty::class.asClassName().parameterizedBy(rootTypeVar, unboxedType)
             }
-            else -> throw null!! // TODO: message of unsupported classifier
         }
     }
 
-    fun createEntityTypes(packageName: String, entityClass: ImmutableKmClass, allEntityClasses: List<ImmutableKmClass>) {
-        val entityClassName = qualifiedNameToClassName(entityClass.name)
+    private fun buildEntityClassType(packageName: String, entityClassName: ClassName, properties: List<ImmutableKmProperty>, allEntityClasses: List<ImmutableKmClass>): TypeSpec {
+        val rootTypeVar = TypeVariableName("Root")
+        val propPathType = String::class.asClassName().copy(nullable = true)
 
-        val interfaceName = "LI${entityClassName.simpleName}"
-        val className = "LC${entityClassName.simpleName}"
-        val unboxedArrowName = "LUA${entityClassName.simpleName}"
-        val listArrowName = "LLA${entityClassName.simpleName}"
-        val objectName = "L${entityClassName.simpleName}"
+        var builder = TypeSpec.classBuilder(lClassTypeName(entityClassName))
+            .addModifiers(KModifier.SEALED)
+            .addTypeVariable(rootTypeVar)
+            .addSuperinterface(ClassName(packageName, lInterfaceName(entityClassName)).parameterizedBy(rootTypeVar))
+            .primaryConstructor(FunSpec.constructorBuilder()
+                .addParameter("_propPath", propPathType)
+                .build())
+            .addProperty(PropertySpec.builder("_propPath", propPathType)
+                .initializer("_propPath")
+                .addModifiers(KModifier.PRIVATE)
+                .build())
+
+        for (property in properties) {
+            val arrowTypeName = getArrowTypeName(packageName, rootTypeVar, property, allEntityClasses)
+                ?: continue
+
+            builder = builder.addProperty(PropertySpec.builder(property.name, arrowTypeName)
+                .addModifiers(KModifier.OVERRIDE)
+                .getter(FunSpec.getterBuilder()
+                    .addCode("return %T(_propPath.appendPathComponent(%S), %S)", arrowTypeName, property.name, property.name)
+                    .build())
+                .build())
+        }
+
+        return builder.build()
+    }
+
+    private fun buildInterfaceType(packageName: String, entityClassName: ClassName, properties: List<ImmutableKmProperty>, allEntityClasses: List<ImmutableKmClass>): TypeSpec {
+        val rootTypeVar = TypeVariableName("Root")
+        val knownOwnerType = LKnownOwner::class.asClassName().parameterizedBy(rootTypeVar, entityClassName)
+
+        var builder = TypeSpec.interfaceBuilder(lInterfaceName(entityClassName))
+            .addTypeVariable(rootTypeVar)
+            .addSuperinterface(knownOwnerType)
+
+        for (property in properties) {
+            val arrowTypeName = getArrowTypeName(packageName, rootTypeVar, property, allEntityClasses)
+                ?: continue
+
+            builder = builder.addProperty(PropertySpec.builder(property.name, arrowTypeName).build())
+        }
+
+        return builder.build()
+    }
+
+    private fun createEntityTypes(packageName: String, entityClass: ImmutableKmClass, allEntityClasses: List<ImmutableKmClass>) {
+        val entityClassName = entityClass.name.asJvmClassName()
 
         val fileSpec = FileSpec.builder(packageName, "L${entityClassName.simpleName}.kt")
             .addImport("com.faintstructure.ebeanoncrack.types", "appendPathComponent")
-            .addType(TypeSpec.interfaceBuilder(interfaceName)
-                .let {
-                    val rootTypeVar = TypeVariableName("Root")
-                    val knownOwnerType = LKnownOwner::class.asClassName().parameterizedBy(rootTypeVar, entityClassName)
-                    var base = it.addTypeVariable(rootTypeVar)
-                        .addSuperinterface(knownOwnerType)
-
-                    for (property in entityClass.properties) {
-                        val propertyOriginalType = typeToClassName(property.returnType)
-
-                        if (allEntityClasses.any { it.name == typeToQualifiedName(property.returnType) }) {
-                            propertyOriginalType as ClassName
-                            val arrowTypeName = ClassName(packageName, "LUA${propertyOriginalType.simpleName}").parameterizedBy(rootTypeVar)
-                            base = base.addProperty(PropertySpec.builder(property.name, arrowTypeName).build())
-                        } else {
-                            val propertyType = when {
-                                propertyOriginalType is ParameterizedTypeName &&
-                                        propertyOriginalType.rawType.reflectionName() == List::class.asClassName().reflectionName() -> {
-
-                                    val typeArgClassName = propertyOriginalType.typeArguments[0] as ClassName
-                                    if (allEntityClasses.any { it.name == classNameToQualifiedName(typeArgClassName) }) {
-                                        ClassName(packageName, "LLA${typeArgClassName.simpleName}").parameterizedBy(rootTypeVar)
-                                    } else {
-                                        LSimpleListProperty::class.asClassName().parameterizedBy(rootTypeVar,
-                                            propertyOriginalType.typeArguments[0])
-                                    }
-                                }
-                                else ->
-                                    LSimpleProperty::class.asClassName().parameterizedBy(rootTypeVar, propertyOriginalType)
-                            }
-                            base = base.addProperty(PropertySpec.builder(property.name, propertyType).build())
-                        }
-                    }
-
-                    base
-                }
-                .build())
-            .addType(TypeSpec.classBuilder(className)
-                .let {
-                    val rootTypeVar = TypeVariableName("Root")
-                    var base = it.addModifiers(KModifier.SEALED)
-                        .addTypeVariable(rootTypeVar)
-                        .addSuperinterface(ClassName(packageName, interfaceName).parameterizedBy(rootTypeVar))
-                        .primaryConstructor(FunSpec.constructorBuilder()
-                            .addParameter("_propPath", String::class.asClassName().copy(nullable = true))
-                            .build())
-                        .addProperty(PropertySpec.builder("_propPath", String::class.asClassName().copy(nullable = true))
-                            .initializer("_propPath")
-                            .addModifiers(KModifier.PRIVATE)
-                            .build())
-
-                    for (property in entityClass.properties) {
-                        val propertyOriginalType = typeToClassName(property.returnType)
-
-                        if (allEntityClasses.any { it.name == typeToQualifiedName(property.returnType) }) {
-                            propertyOriginalType as ClassName
-                            val arrowTypeName = ClassName(packageName, "LUA${propertyOriginalType.simpleName}").parameterizedBy(rootTypeVar)
-                            base = base.addProperty(PropertySpec.builder(property.name, arrowTypeName)
-                                .addModifiers(KModifier.OVERRIDE)
-                                .getter(FunSpec.getterBuilder()
-                                    .addCode("return %T(_propPath.appendPathComponent(%S), %S)", arrowTypeName, property.name, property.name)
-                                    .build())
-                                .build())
-                        } else {
-                            val propertyType = when {
-                                propertyOriginalType is ParameterizedTypeName &&
-                                        propertyOriginalType.rawType.reflectionName() == List::class.asClassName().reflectionName() -> {
-
-                                    val typeArgClassName = propertyOriginalType.typeArguments[0] as ClassName
-                                    if (allEntityClasses.any { it.name == classNameToQualifiedName(typeArgClassName) }) {
-                                        ClassName(packageName, "LLA${typeArgClassName.simpleName}").parameterizedBy(rootTypeVar)
-                                    } else {
-                                        LSimpleListProperty::class.asClassName().parameterizedBy(rootTypeVar,
-                                            propertyOriginalType.typeArguments[0])
-                                    }
-                                }
-                                else ->
-                                    LSimpleProperty::class.asClassName().parameterizedBy(rootTypeVar, propertyOriginalType)
-                            }
-                            base = base.addProperty(PropertySpec.builder(property.name, propertyType)
-                                .addModifiers(KModifier.OVERRIDE)
-                                .getter(FunSpec.getterBuilder()
-                                    .addCode("return %T(_propPath.appendPathComponent(%S), %S)", propertyType, property.name, property.name)
-                                    .build())
-                                .build())
-                        }
-                    }
-
-                    base
-                }
-                .build())
-            .addType(TypeSpec.classBuilder(unboxedArrowName)
-                .let {
-                    val rootTypeVar = TypeVariableName("Root")
-                    it.addTypeVariable(rootTypeVar)
-                        .superclass(ClassName(packageName, className).parameterizedBy(rootTypeVar))
-                        .addSuperclassConstructorParameter(CodeBlock.of("_propPath"))
-                        .addSuperinterface(LProperty::class.asClassName().parameterizedBy(rootTypeVar, entityClassName, entityClassName))
-                        .primaryConstructor(FunSpec.constructorBuilder()
-                            .addParameter("_propPath", String::class.asClassName())
-                            .addParameter("_propName", String::class.asClassName())
-                            .build())
-                        .addProperty(PropertySpec.builder("_propPath", String::class.asClassName())
-                            .initializer("_propPath")
-                            .addModifiers(KModifier.PRIVATE)
-                            .build())
-                        .addProperty(PropertySpec.builder("_propName", String::class.asClassName())
-                            .initializer("_propName")
-                            .addModifiers(KModifier.PRIVATE)
-                            .build())
-                        .addFunction(FunSpec.builder("getPropertyPath")
-                            .returns(String::class)
-                            .addModifiers(KModifier.OVERRIDE)
-                            .addCode("return _propPath")
-                            .build())
-                        .addFunction(FunSpec.builder("getPropertyName")
-                            .returns(String::class)
-                            .addModifiers(KModifier.OVERRIDE)
-                            .addCode("return _propName")
-                            .build())
-                }
-                .build())
-            .addType(TypeSpec.classBuilder(listArrowName)
-                .let {
-                    val rootTypeVar = TypeVariableName("Root")
-                    it.addTypeVariable(rootTypeVar)
-                        .superclass(ClassName(packageName, className).parameterizedBy(rootTypeVar))
-                        .addSuperclassConstructorParameter(CodeBlock.of("_propPath"))
-                        .addSuperinterface(LProperty::class.asClassName().parameterizedBy(rootTypeVar, List::class.asClassName().parameterizedBy(entityClassName), entityClassName))
-                        .primaryConstructor(FunSpec.constructorBuilder()
-                            .addParameter("_propPath", String::class.asClassName())
-                            .addParameter("_propName", String::class.asClassName())
-                            .build())
-                        .addProperty(PropertySpec.builder("_propPath", String::class.asClassName())
-                            .initializer("_propPath")
-                            .addModifiers(KModifier.PRIVATE)
-                            .build())
-                        .addProperty(PropertySpec.builder("_propName", String::class.asClassName())
-                            .initializer("_propName")
-                            .addModifiers(KModifier.PRIVATE)
-                            .build())
-                        .addFunction(FunSpec.builder("getPropertyPath")
-                            .returns(String::class)
-                            .addModifiers(KModifier.OVERRIDE)
-                            .addCode("return _propPath")
-                            .build())
-                        .addFunction(FunSpec.builder("getPropertyName")
-                            .returns(String::class)
-                            .addModifiers(KModifier.OVERRIDE)
-                            .addCode("return _propName")
-                            .build())
-                }
-                .build())
-            .addType(TypeSpec.objectBuilder(objectName)
-                .superclass(ClassName(packageName, className).parameterizedBy(entityClassName))
-                .addSuperclassConstructorParameter("null")
-                .build())
+            .addType(buildInterfaceType(packageName, entityClassName, entityClass.properties, allEntityClasses))
+            .addType(buildEntityClassType(packageName, entityClassName, entityClass.properties, allEntityClasses))
+            .addType(buildArrowClassType(packageName, entityClassName, ArrowType.UNBOXED))
+            .addType(buildArrowClassType(packageName, entityClassName, ArrowType.LIST))
+            .addType(buildEntityObjectType(packageName, entityClassName))
 
         writeFileSpec(fileSpec.build())
     }
@@ -251,11 +184,9 @@ class FileGenerator : AbstractProcessor(){
         val entityElements = roundEnvironment.getElementsAnnotatedWith(EntityOnCrack::class.java)
         val entityClasses = entityElements.map { it.getAnnotation(Metadata::class.java).toImmutableKmClass() }
 
-        println("Entity classes:")
         val arrowPackage = "realarrows"
 
         for (entityClass in entityClasses) {
-            println("\t" + entityClass.name)
             createEntityTypes(arrowPackage, entityClass, entityClasses)
         }
 
